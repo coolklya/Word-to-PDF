@@ -402,6 +402,7 @@ CYBER_CSS = """
 
 .ext-docx { background: rgba(0,184,255,0.15); color: var(--cyan2); border: 1px solid rgba(0,184,255,0.3); }
 .ext-doc  { background: rgba(255,45,120,0.12); color: var(--magenta); border: 1px solid var(--border2); }
+.ext-pdf  { background: rgba(240,224,0,0.10);  color: var(--yellow); border: 1px solid rgba(240,224,0,0.35); }
 
 /* ── Log Box ──────────────────────────────────────────────── */
 .log-box {
@@ -646,36 +647,69 @@ def render_file_table(file_order: list):
 # 核心轉換邏輯
 # ──────────────────────────────────────────────────────────────────────────────
 def run_conversion(file_order: list, file_map: dict, do_merge: bool, merge_name: str):
-    """執行 Word → PDF 批次轉換（並依需求合併）。結果存入 session_state。"""
+    """
+    依照使用者排好的序號逐一處理每個檔案：
+    - .doc / .docx → LibreOffice 轉換為 PDF bytes，再加入合併
+    - .pdf          → 直接讀取 bytes，加入合併
+    所有成功的檔案均按原始序號完整納入輸出，不因類型不同而遺漏。
+    """
     total = len(file_order)
-    logs = []
-    pdfs_in_order = []          # list of (name, bytes)
+    logs  = []
+    # pdfs_in_order: list of (display_name, pdf_bytes)
+    # 每個位置對應 file_order 中的同一序號；失敗的位置為 None
+    pdfs_in_order = []
 
     progress_bar = st.progress(0, text="⚙  系統初始化中...")
     status_box   = st.empty()
 
+    WORD_EXTS = {".doc", ".docx"}
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        # ── 轉換階段 ──────────────────────────────────────────
+        # ── 逐檔處理階段（依序號）────────────────────────────
         for i, name in enumerate(file_order):
-            frac = i / total
-            progress_bar.progress(frac, text=f"⚙  轉換中 ({i + 1}/{total})：{name}")
+            progress_bar.progress(i / total, text=f"⚙  處理中 ({i + 1}/{total})：{name}")
             status_box.markdown(
-                f'<div class="status-line">▷ 處理：<span class="hl-cyan">{name}</span></div>',
+                f'<div class="status-line">▷ [{i+1:02d}/{total:02d}] '
+                f'<span class="hl-cyan">{name}</span></div>',
                 unsafe_allow_html=True,
             )
 
-            f = file_map[name]
-            # 需 seek(0) 以防止重複讀取時位置錯誤
+            ext = Path(name).suffix.lower()
+            f   = file_map[name]
             f.seek(0)
-            pdf_bytes, log_msg = convert_word_to_pdf_via_libreoffice(
-                f.read(), f.name, tmpdir
-            )
 
-            if pdf_bytes:
-                pdfs_in_order.append((name, pdf_bytes))
-                logs.append(("ok", log_msg))
+            if ext in WORD_EXTS:
+                # ── Word → PDF via LibreOffice ────────────────
+                pdf_bytes, log_msg = convert_word_to_pdf_via_libreoffice(
+                    f.read(), f.name, tmpdir
+                )
+                if pdf_bytes:
+                    pdfs_in_order.append((name, pdf_bytes))
+                    logs.append(("ok", f"[WORD→PDF] {log_msg}"))
+                else:
+                    pdfs_in_order.append(None)
+                    logs.append(("err", f"[WORD→PDF] {log_msg}"))
+
+            elif ext == ".pdf":
+                # ── PDF 直通（直接讀取 bytes）─────────────────
+                try:
+                    raw = f.read()
+                    # 驗證可正常被 pypdf 讀取
+                    PdfReader(io.BytesIO(raw))
+                    pdfs_in_order.append((name, raw))
+                    logs.append(("ok", f"[PDF直通] ✅ {name}"))
+                except Exception as exc:
+                    pdfs_in_order.append(None)
+                    logs.append(("err", f"[PDF直通] ❌ {name} — 無法讀取：{exc}"))
+
             else:
-                logs.append(("err", log_msg))
+                pdfs_in_order.append(None)
+                logs.append(("wrn", f"⚠ 跳過不支援的格式：{name}"))
+
+        # ── 統計有效項目（保留原始序號以供日誌對照）────────────
+        valid = [(n, b) for item in pdfs_in_order
+                 if item is not None
+                 for n, b in [item]]
 
         # ── 輸出階段 ──────────────────────────────────────────
         progress_bar.progress(0.95, text="⚙  組裝輸出檔案...")
@@ -683,15 +717,18 @@ def run_conversion(file_order: list, file_map: dict, do_merge: bool, merge_name:
         download_filename = ""
         download_mime     = ""
 
-        if pdfs_in_order:
+        if valid:
             if do_merge:
                 status_box.markdown(
-                    '<div class="status-line">🧩 合併 PDF 中，依清單順序...</div>',
+                    '<div class="status-line">🧩 依序號順序合併所有 PDF...</div>',
                     unsafe_allow_html=True,
                 )
                 merger = PdfWriter()
-                for _, pdf_b in pdfs_in_order:
+                for seq_i, (item_name, pdf_b) in enumerate(
+                    (x for x in pdfs_in_order if x is not None), start=1
+                ):
                     merger.append(io.BytesIO(pdf_b))
+
                 out = io.BytesIO()
                 merger.write(out)
                 download_bytes    = out.getvalue()
@@ -699,22 +736,22 @@ def run_conversion(file_order: list, file_map: dict, do_merge: bool, merge_name:
                     merge_name if merge_name.endswith(".pdf") else merge_name + ".pdf"
                 )
                 download_mime = "application/pdf"
-                logs.append(("inf", f"🎉 合併完成（{len(pdfs_in_order)} 個）→ {download_filename}"))
+                logs.append(("inf", f"🎉 合併完成（{len(valid)} 個檔案）→ {download_filename}"))
             else:
                 status_box.markdown(
-                    '<div class="status-line">📦 打包為 ZIP...</div>',
+                    '<div class="status-line">📦 打包為 ZIP（各自保留原 PDF）...</div>',
                     unsafe_allow_html=True,
                 )
                 zip_buf = io.BytesIO()
                 with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for name, pdf_b in pdfs_in_order:
-                        zf.writestr(Path(name).stem + ".pdf", pdf_b)
+                    for item_name, pdf_b in valid:
+                        zf.writestr(Path(item_name).stem + ".pdf", pdf_b)
                 download_bytes    = zip_buf.getvalue()
                 download_filename = "converted_pdfs.zip"
                 download_mime     = "application/zip"
-                logs.append(("inf", f"📦 已打包 {len(pdfs_in_order)} 個 PDF → {download_filename}"))
+                logs.append(("inf", f"📦 已打包 {len(valid)} 個 PDF → {download_filename}"))
         else:
-            logs.append(("err", "⚠  沒有任何成功轉換的檔案，無法產生輸出。"))
+            logs.append(("err", "⚠  沒有任何可用的 PDF，無法產生輸出。請確認檔案未損毀。"))
 
         progress_bar.progress(1.0, text="✔  完成")
         status_box.empty()
@@ -738,11 +775,11 @@ def run_conversion(file_order: list, file_map: dict, do_merge: bool, merge_name:
 # Tab 1：批次轉檔與合併
 # ──────────────────────────────────────────────────────────────────────────────
 def tab_convert():
-    st.markdown('<div class="section-label">📤 上傳 Word 文件</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">📤 上傳文件（Word / PDF 混合皆可）</div>', unsafe_allow_html=True)
 
     uploaded = st.file_uploader(
-        "支援 .doc / .docx，可一次選取多個檔案",
-        type=["doc", "docx"],
+        "支援 .doc / .docx / .pdf，可一次選取多個檔案",
+        type=["doc", "docx", "pdf"],
         accept_multiple_files=True,
         label_visibility="collapsed",
         key="tab1_uploader",
@@ -751,8 +788,9 @@ def tab_convert():
     if not uploaded:
         st.markdown(
             '<div class="empty-hint">'
-            '上傳 .doc / .docx 文件後，系統將以<span class="hl-cyan">智慧排序</span>自動整理清單。<br>'
-            '你可使用 ▲▼ 按鈕調整合併順序，接著按下執行按鈕。'
+            '上傳 <span class="hl-cyan">.doc / .docx</span> 或 <span class="hl-yellow">.pdf</span> 文件後，'
+            '系統將以<span class="hl-cyan">智慧排序</span>自動整理清單。<br>'
+            'Word 檔將自動轉為 PDF；PDF 檔直接納入合併。'
             '</div>',
             unsafe_allow_html=True,
         )
